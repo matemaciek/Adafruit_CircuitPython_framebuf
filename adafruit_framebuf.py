@@ -27,6 +27,7 @@ Implementation Notes
 __version__ = "0.0.0-auto.0"
 __repo__ = "https://github.com/adafruit/Adafruit_CircuitPython_framebuf.git"
 
+import math
 import os
 import struct
 
@@ -245,7 +246,7 @@ class FrameBuffer:
             return None
         if color is None:
             return self.format.get_pixel(self, x, y)
-        self.format.set_pixel(self, x, y, color)
+        self.format.set_pixel(self, x, y, 1 - self.format.get_pixel(self, x, y) if color == -1 else color)
         return None
 
     def hline(self, x, y, width, color):
@@ -380,7 +381,7 @@ class FrameBuffer:
             y += dt_y
 
     # pylint: disable=too-many-arguments
-    def text(self, string, x, y, color, *, font_name="font5x8.bin", size=1):
+    def text(self, string, x, y, color, *, font_name="font5x8.bin"):
         """Place text on the screen in variables sizes. Breaks on \n to next line.
 
         Does not break on line going off screen.
@@ -393,20 +394,22 @@ class FrameBuffer:
 
         for chunk in string.split("\n"):
             if not self._font or self._font.font_name != font_name:
+                if self._font:
+                    self._font.deinit()
                 # load the font!
                 self._font = BitmapFont(font_name)
             width = self._font.font_width
             height = self._font.font_height
             for i, char in enumerate(chunk):
-                char_x = x + (i * (width + 1)) * size
+                char_x = x + i * width
                 if (
-                    char_x + (width * size) > 0
+                    char_x + width > 0
                     and char_x < frame_width
-                    and y + (height * size) > 0
+                    and y + height > 0
                     and y < frame_height
                 ):
-                    self._font.draw_char(char, char_x, y, self, color, size=size)
-            y += height * size
+                    self._font.draw_char(char, char_x, y, self, color)
+            y += height
 
     # pylint: enable=too-many-arguments
 
@@ -446,7 +449,7 @@ class FrameBuffer:
 
 
 # MicroPython basic bitmap font renderer.
-# Author: Tony DiCola
+# Author: Tony DiCola, Maciej Sokolowski
 # License: MIT License (https://opensource.org/licenses/MIT)
 class BitmapFont:
     """A helper class to read binary font tiles and 'seek' through them as a
@@ -462,8 +465,8 @@ class BitmapFont:
         # - 1 unsigned byte: font character width in pixels
         # - 1 unsigned byte: font character height in pixels
         # - x bytes: font data, in ASCII order covering all 255 characters.
-        #            Each character should have a byte for each pixel column of
-        #            data (i.e. a 5x8 font has 5 bytes per character).
+        #            Each character should have a k*8 bits for each pixel row of
+        #            data (i.e. a 5x8 font has 8 bytes per character).
         self.font_name = font_name
 
         # Open the font file and grab the character width and height values.
@@ -471,8 +474,10 @@ class BitmapFont:
         try:
             self._font = open(self.font_name, "rb")
             self.font_width, self.font_height = struct.unpack("BB", self._font.read(2))
+            self._font_width_bytes = math.ceil(self.font_width / 8)
+            self._bytes_per_char = self._font_width_bytes * self.font_height
             # simple font file validation check based on expected file size
-            if 2 + 256 * self.font_width != os.stat(font_name)[6]:
+            if 2 + 256 * self._bytes_per_char != os.stat(font_name)[6]:
                 raise RuntimeError("Invalid font file: " + font_name)
         except OSError:
             print("Could not find font file", font_name)
@@ -496,33 +501,31 @@ class BitmapFont:
         self.deinit()
 
     def draw_char(
-        self, char, x, y, framebuffer, color, size=1
+        self, char, x, y, framebuffer, color
     ):  # pylint: disable=too-many-arguments
         """Draw one character at position (x,y) to a framebuffer in a given color"""
-        size = max(size, 1)
         # Don't draw the character if it will be clipped off the visible area.
         # if x < -self.font_width or x >= framebuffer.width or \
         #   y < -self.font_height or y >= framebuffer.height:
         #    return
-        # Go through each column of the character.
-        for char_x in range(self.font_width):
+        # Go through each row of the character.
+        for char_y in range(self.font_height):
             # Grab the byte for the current column of font data.
-            self._font.seek(2 + (ord(char) * self.font_width) + char_x)
+            self._font.seek(2 + (ord(char) * self._bytes_per_char) + char_y*self._font_width_bytes)
             try:
-                line = struct.unpack("B", self._font.read(1))[0]
+                bytes = struct.unpack("B"*self._font_width_bytes, self._font.read(self._font_width_bytes))
             except RuntimeError:
                 continue  # maybe character isnt there? go to next
-            # Go through each row in the column byte.
-            for char_y in range(self.font_height):
+            # Go through each column in the row bytes.
+            for char_x in range(self.font_width):
+                byte_id = char_x // 8
                 # Draw a pixel for each bit that's flipped on.
-                if (line >> char_y) & 0x1:
-                    framebuffer.fill_rect(
-                        x + char_x * size, y + char_y * size, size, size, color
-                    )
+                if (bytes[byte_id] >> (char_x % 8)) & 0x1:
+                    framebuffer.pixel(x + char_x, y + char_y, color)
 
     def width(self, text):
         """Return the pixel width of the specified text message."""
-        return len(text) * (self.font_width + 1)
+        return len(text) * self.font_width + 1
 
 
 class FrameBuffer1(FrameBuffer):  # pylint: disable=abstract-method
